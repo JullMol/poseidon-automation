@@ -1,0 +1,4 @@
+*.ipynb
+scratch_code.txt
+__pycache__/
+*.pkl
