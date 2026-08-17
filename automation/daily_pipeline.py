@@ -18,9 +18,9 @@ import lightgbm as lgb
 import xgboost as xgb
 
 # --- Configuration & Credentials ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://your-project.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your-anon-key")
-GFW_API_KEY = os.environ.get("GFW_API_KEY", "your-gfw-api-key")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+GFW_API_KEY = os.environ.get("GFW_API_KEY")
 EE_SERVICE_ACCOUNT = os.environ.get("EE_SERVICE_ACCOUNT")
 EE_PRIVATE_KEY = os.environ.get("EE_PRIVATE_KEY")
 
