@@ -1,0 +1,11 @@
+pandas
+numpy
+supabase
+gdown
+lightgbm
+xgboost
+scikit-learn
+requests
+google-api-python-client
+earthengine-api
+tqdm
