@@ -31,7 +31,7 @@ except Exception as e:
     sys.exit(1)
 
 # Drive ID for the trained Ensemble model (ZIP file)
-MODEL_GDRIVE_ID = os.environ.get("MODEL_GDRIVE_ID", "1HPbgZ5Evo3cL9wrUcaQTBNzXp_Dsum8G")
+MODEL_GDRIVE_ID = os.environ.get("MODEL_GDRIVE_ID")
 
 # GFW API Latency Configuration (in days)
 GFW_LATENCY_DAYS = 3
