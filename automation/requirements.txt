@@ -1,11 +1,12 @@
 pandas
 numpy
 supabase
-gdown
+earthengine-api
+joblib
 lightgbm
 xgboost
+gfwapiclient
+gdown
+geopandas
+shapely
 scikit-learn
-requests
-google-api-python-client
-earthengine-api
-tqdm
