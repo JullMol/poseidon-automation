@@ -5,7 +5,7 @@ earthengine-api
 joblib
 lightgbm
 xgboost
-gfwapiclient
+gfw-api-python-client
 gdown
 geopandas
 shapely
