@@ -1,0 +1,44 @@
+name: POSEIDON Backfill (July - August)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-backfill:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      GFW_API_TOKEN: ${{ secrets.GFW_API_TOKEN }}
+      EE_SERVICE_ACCOUNT: ${{ secrets.EE_SERVICE_ACCOUNT }}
+      EE_PRIVATE_KEY: ${{ secrets.EE_PRIVATE_KEY }}
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install System Dependencies for GeoPandas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev python3-rtree
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r automation/requirements.txt
+
+      - name: Download Phase 3 & 4 Models from Hugging Face
+        run: |
+          mkdir -p automation/models
+          wget -O automation/models/poseidon_models.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/poseidon_models.pkl
+          wget -O automation/models/model_length_gb.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/model_length_gb.pkl
+          wget -O automation/models/model_fishing_score_xgboost.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/model_fishing_score_xgboost.pkl
+
+      - name: Execute POSEIDON Backfill Pipeline
+        run: |
+          python automation/backfill_pipeline.py
