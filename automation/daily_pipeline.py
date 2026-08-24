@@ -1,545 +1,647 @@
 import os
 import sys
 import json
-import datetime
-import asyncio
 import time
-import io
-import requests
-import urllib.request
+import datetime
+import zipfile
 import joblib
-import pandas as pd
+import requests
 import numpy as np
+import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point, shape
-from shapely.vectorized import contains as shapely_contains
+from scipy.spatial import cKDTree
+from shapely.geometry import Point, Polygon, MultiPolygon
 from supabase import create_client, Client
-import warnings
-from shapely.errors import ShapelyDeprecationWarning
 
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
+try:
+    from shapely import contains_xy
+except ImportError:
+    from shapely.vectorized import contains as contains_xy
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-GFW_API_TOKEN = os.environ.get("GFW_API_TOKEN")
 
 HF_BASE_URL = "https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model"
 HF_MODEL_URLS = {
-    "gfw_models": f"{HF_BASE_URL}/GFW/poseidon_models_gfw.pkl",
-    "gee_models": f"{HF_BASE_URL}/GEE/poseidon_models_gee.pkl",
-    "isolation_forest": f"{HF_BASE_URL}/GEE/isolation_forest_model.pkl",
     "length_model": f"{HF_BASE_URL}/model_length_gb.pkl",
-    "fishing_model": f"{HF_BASE_URL}/model_fishing_score_xgboost.pkl"
+    "fishing_model": f"{HF_BASE_URL}/model_fishing_score_xgboost.pkl",
+    "isolation_forest": f"{HF_BASE_URL}/GEE/isolation_forest_model.pkl",
+    "gee_models": f"{HF_BASE_URL}/GEE/poseidon_models_gee.pkl",
 }
 
-MODEL_CACHE_DIR = "automation/models"
-os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+GDRIVE_MODEL_IDS = {
+    "length_model": "1IPKwME5f-TgfqE5V3f99JAwKmi4y1e8R",
+    "fishing_model": "1JfJ7ww1f-zRoCF1kezwSTy7e4_1szsxy",
+}
 
 FEATURE_LABELS_MAP = {
-    'vv_intensity_db': 'Intensitas radar VV',
-    'vh_intensity_db': 'Intensitas radar VH',
-    'radar_intensity_diff': 'Selisih intensitas VV-VH',
-    'background_clutter': 'Clutter latar radar',
-    'snr_db': 'Signal-to-noise ratio',
-    'length_m_new': 'Panjang kapal',
-    'dist_to_nearest_mpa_km': 'Jarak ke kawasan konservasi',
-    'dist_to_eez_boundary_km': 'Jarak ke batas ZEE',
-    'dist_to_nearest_port_km': 'Jarak ke pelabuhan',
-    'dist_to_nearest_seizure_km': 'Jarak ke lokasi penyitaan historis',
-    'fishing_score_new': 'Skor aktivitas penangkapan ikan',
-    'historical_hotspot': 'Riwayat hotspot area',
-    'quarter': 'Kuartal musim'
+    'vv_intensity_db': 'Intensitas Radar VV (dB)',
+    'vh_intensity_db': 'Intensitas Radar VH (dB)',
+    'radar_intensity_diff': 'Rasio Polarimetri VV/VH (dB)',
+    'background_clutter': 'Derau Hamburan Laut (Clutter)',
+    'snr_db': 'Rasio Sinyal terhadap Derau (SNR dB)',
+    'length_m_new': 'Estimasi Panjang Kapal (m)',
+    'dist_to_nearest_mpa_km': 'Jarak ke Kawasan Konservasi (km)',
+    'dist_to_eez_boundary_km': 'Jarak ke Batas ZEE (km)',
+    'dist_to_nearest_port_km': 'Jarak ke Pelabuhan Terdekat (km)',
+    'dist_to_nearest_seizure_km': 'Jarak ke Titik Tangkapan Historis (km)',
+    'fishing_score_new': 'Indeks Probabilitas Penangkapan Ikan',
+    'historical_hotspot': 'Zona Rawan Pelanggaran Historis',
+    'quarter': 'Kuartal Operasional',
 }
 
-def _sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+ALPHA_CONFORMAL = 0.10
 
-def get_supabase():
+def get_supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables are required to connect to Supabase.")
+        raise ValueError("SUPABASE_URL dan SUPABASE_KEY wajib disetel.")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def get_reference_thresholds(target_date: datetime.date, supabase_client=None) -> dict:
-    curr_q = int((target_date.month - 1) // 3 + 1)
-    ref_year = target_date.year - 1
-    date_start = f"{ref_year}-01-01"
-    date_end = f"{ref_year}-12-31"
-
-    fallback = {
-        1: {'q75': 0.00095800, 'q90': 0.00327450, 'q_hat': 0.00080000},
-        2: {'q75': 0.00126175, 'q90': 0.00846870, 'q_hat': 0.00095000},
-        3: {'q75': 0.00112400, 'q90': 0.00582100, 'q_hat': 0.00090000},
-        4: {'q75': 0.00108600, 'q90': 0.00491300, 'q_hat': 0.00085000},
-    }
-
-    try:
-        if supabase_client is None:
-            supabase_client = get_supabase()
-        resp = supabase_client.table("vessel_detections") \
-            .select("raw_risk_score, pass_date") \
-            .gte("pass_date", date_start) \
-            .lte("pass_date", date_end) \
-            .execute()
-        rows = resp.data if resp.data else []
-        if not rows:
-            print(f"Tidak ada data referensi {ref_year} di Supabase, pakai fallback thresholds.")
-            return fallback[curr_q]
-
-        df_ref = pd.DataFrame(rows)
-        df_ref['quarter'] = pd.to_datetime(df_ref['pass_date']).dt.quarter
-        sub = df_ref[df_ref['quarter'] == curr_q]['raw_risk_score'].dropna().values
-
-        if len(sub) < 10:
-            print(f"Data referensi Q{curr_q} {ref_year} terlalu sedikit ({len(sub)} baris), pakai fallback.")
-            return fallback[curr_q]
-
-        q75 = float(np.percentile(sub, 75))
-        q90 = float(np.percentile(sub, 90))
-        q_hat = float(np.percentile(sub, 69))
-        print(f"Thresholds dinamis Q{curr_q} {ref_year}: q75={q75:.8f}, q90={q90:.8f}, q_hat={q_hat:.8f} (n={len(sub)})")
-        return {'q75': q75, 'q90': q90, 'q_hat': q_hat}
-
-    except Exception as e:
-        print(f"Gagal ambil thresholds dari Supabase: {e}. Pakai fallback thresholds.")
-        return fallback[curr_q]
-
-def load_hf_model(model_key: str):
-    url = HF_MODEL_URLS[model_key]
-    filename = url.split('/')[-1]
-    local_path = os.path.join(MODEL_CACHE_DIR, filename)
+def init_gee():
+    import ee
     
-    if os.path.exists(local_path):
-        print(f"Loading {model_key} dari cache: {local_path}")
-        return joblib.load(local_path)
+    ee_sa = os.environ.get("EE_SERVICE_ACCOUNT")
+    ee_pk = os.environ.get("EE_PRIVATE_KEY")
+    ee_proj = os.environ.get("EE_PROJECT", "darvin-natuna-2025")
     
-    print(f"Downloading {model_key} dari HuggingFace: {url}")
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as resp:
-            content = resp.read()
-            with open(local_path, 'wb') as f:
-                f.write(content)
-            return joblib.load(io.BytesIO(content))
-    except Exception as e:
-        print(f"Gagal download model {model_key} dari HuggingFace: {e}")
-        raise e
-
-def apply_phase1_cleaning_filters(df_raw: pd.DataFrame) -> pd.DataFrame:
-    if df_raw.empty:
-        return df_raw
+    if ee_sa and ee_pk:
+        if "\\n" in ee_pk:
+            ee_pk = ee_pk.replace("\\n", "\n")
+        credentials = ee.ServiceAccountCredentials(ee_sa, key_data=ee_pk)
+        ee.Initialize(credentials=credentials, project=ee_proj)
+        print("Autentikasi GEE via Environment Variables (GitHub Secrets).")
+        return
         
-    spatial_dir = "automation/spatial"
-    os.makedirs(spatial_dir, exist_ok=True)
-    wpp_geojson_path = os.path.join(spatial_dir, "wpp711_big_resmi.geojson")
-    local_data_path = os.path.join("data", "wpp711_geojson.json")
-    
-    wpp711_geom = None
-    if os.path.exists(local_data_path):
+    raise ValueError("Kredensial GEE (EE_SERVICE_ACCOUNT & EE_PRIVATE_KEY) tidak ditemukan di Environment Variables. Dilarang menggunakan kredensial lokal (Hardcoded JSON).")
+
+def load_model_file(model_key: str):
+    filename_map = {
+        "length_model": "model_length_gb.pkl",
+        "fishing_model": "model_fishing_score_xgboost.pkl",
+        "isolation_forest": "isolation_forest_model.pkl",
+        "gee_models": "poseidon_models_gee.pkl",
+    }
+    fname = filename_map[model_key]
+    cache_dir = os.path.join("automation", "models")
+    os.makedirs(cache_dir, exist_ok=True)
+    local_path = os.path.join(cache_dir, fname)
+
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
+        return joblib.load(local_path)
+
+    if model_key in GDRIVE_MODEL_IDS:
         try:
-            with open(local_data_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if 'features' in d and len(d['features']) > 0:
-                wpp711_geom = shape(d['features'][0]['geometry'])
-            elif 'coordinates' in d:
-                wpp711_geom = shape(d)
+            import gdown
+            print(f"Mengunduh model {fname} dari Google Drive...")
+            gdown.download(id=GDRIVE_MODEL_IDS[model_key], output=local_path, quiet=True)
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
+                return joblib.load(local_path)
         except Exception:
             pass
-            
-    if wpp711_geom is None:
-        if not os.path.exists(wpp_geojson_path):
-            print("Mengunduh batas polygon resmi WPP 711 dari BIG Satu Peta...")
-            big_url = "https://kspservices.big.go.id/satupeta/rest/services/PUBLIK/SUMBER_DAYA_ALAM_DAN_LINGKUNGAN/MapServer/21/query"
-            params = {"where": "namobj = 'WPP-RI 711'", "outFields": "*", "f": "geojson"}
-            headers = {"User-Agent": "Mozilla/5.0"}
-            try:
-                res = requests.get(big_url, params=params, headers=headers, timeout=60)
-                res.raise_for_status()
-                with open(wpp_geojson_path, "w", encoding="utf-8") as f:
-                    f.write(res.text)
-            except Exception as e:
-                print(f"Peringatan: Gagal unduh geojson BIG ({e}), fallback ke boundary shapefile.")
-                wpp_geojson_path = os.path.join(spatial_dir, "poseidon_spatial_data", "shapefiles", "zee_wpp711.shp")
-                
-        if wpp_geojson_path.endswith(".shp"):
-            wpp_gdf = gpd.read_file(wpp_geojson_path)
-            wpp711_geom = wpp_gdf.geometry.union_all()
-        else:
-            with open(wpp_geojson_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if 'features' in d and len(d['features']) > 0:
-                wpp711_geom = shape(d['features'][0]['geometry'])
-            elif 'coordinates' in d:
-                wpp711_geom = shape(d)
-    
-    initial_count = len(df_raw)
-    mask_poly = shapely_contains(wpp711_geom, df_raw['lon'].values, df_raw['lat'].values)
-    df_clean = df_raw[mask_poly].copy()
-    print(f"Filter polygon WPP 711 BIG: {initial_count:,} -> {len(df_clean):,} baris")
-    
-    if 'presence_score' in df_clean.columns:
-        df_clean['presence_score'] = pd.to_numeric(df_clean['presence_score'], errors='coerce')
-        count_pre = len(df_clean)
-        df_clean = df_clean[df_clean['presence_score'] >= 0.7].copy()
-        print(f"Filter presence_score >= 0.7: {count_pre:,} -> {len(df_clean):,} baris")
-        
-    if 'scene_id' in df_clean.columns:
-        dedup_cols = ['scene_id', 'lat', 'lon']
-    elif 'pass_date' in df_clean.columns:
-        dedup_cols = ['pass_date', 'lat', 'lon']
-    else:
-        dedup_cols = ['lat', 'lon']
-        
-    count_dedup = len(df_clean)
-    df_clean = df_clean.drop_duplicates(subset=dedup_cols).copy()
-    print(f"Deduplikasi titik overlap ({dedup_cols}): {count_dedup:,} -> {len(df_clean):,} baris")
-    
-    if 'matched_category' in df_clean.columns:
-        df_clean = df_clean[~df_clean['matched_category'].isin(['noisy_vessel', 'discrepancy'])].copy()
-        df_clean['matched_category'] = df_clean['matched_category'].replace('seismic_vessel', 'seismicvessel')
-        
-    return df_clean.reset_index(drop=True)
 
-async def scrape_gfw_async(target_date: datetime.date) -> pd.DataFrame:
-    print(f"Mengambil data GFW API untuk tanggal: {target_date}")
-    if not GFW_API_TOKEN:
-        print("Peringatan: GFW_API_TOKEN tidak ditemukan.")
-        return pd.DataFrame()
-        
-    try:
-        import gfwapiclient as gfw
-        client = gfw.Client(access_token=GFW_API_TOKEN)
-        date_str = target_date.strftime("%Y-%m-%d")
-        geojson = {
-            "type": "Polygon",
-            "coordinates": [[[102.90, -4.16], [111.05, -4.16], [111.05, 7.74], [102.90, 7.74], [102.90, -4.16]]]
-        }
-        result = await client.fourwings.create_sar_presence_report(
-            start_date=date_str, end_date=date_str, spatial_resolution="HIGH", geojson=geojson
-        )
-        data_list = result.data()
-        if not data_list:
-            return pd.DataFrame()
-        df = pd.DataFrame(data_list)
-        if 'latitude' in df.columns: df.rename(columns={'latitude': 'lat', 'longitude': 'lon'}, inplace=True)
-        if 'date' in df.columns: df.rename(columns={'date': 'pass_date'}, inplace=True)
-        
-        df_cleaned = apply_phase1_cleaning_filters(df)
-        return df_cleaned
-    except Exception as e:
-        print(f"Error GFW API: {e}")
+    hf_url = HF_MODEL_URLS[model_key]
+    print(f"Mengunduh model {fname} dari Hugging Face...")
+    r = requests.get(hf_url, stream=True, timeout=180)
+    r.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=16384):
+            f.write(chunk)
+    return joblib.load(local_path)
+
+def get_p70_quarter_reference_threshold(target_date: datetime.date, supabase_client=None) -> float:
+    ref_year = target_date.year - 1
+    curr_q = int((target_date.month - 1) // 3 + 1)
+    q_date_ranges = {
+        1: (f"{ref_year}-01-01", f"{ref_year}-03-31"),
+        2: (f"{ref_year}-04-01", f"{ref_year}-06-30"),
+        3: (f"{ref_year}-07-01", f"{ref_year}-09-30"),
+        4: (f"{ref_year}-10-01", f"{ref_year}-12-31")
+    }
+    start_d, end_d = q_date_ranges[curr_q]
+
+    if supabase_client is None:
+        supabase_client = get_supabase()
+
+    print(f"Mengambil data referensi raw_risk_score Q{curr_q} {ref_year} ({start_d} s.d. {end_d}) dari Supabase...")
+    all_rows = []
+    page_size = 1000
+    start_idx = 0
+    while True:
+        resp = supabase_client.table("vessel_detections") \
+            .select("raw_risk_score") \
+            .gte("pass_date", start_d) \
+            .lte("pass_date", end_d) \
+            .range(start_idx, start_idx + page_size - 1) \
+            .execute()
+        batch = resp.data if resp.data else []
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start_idx += page_size
+
+    if all_rows:
+        vals = pd.DataFrame(all_rows)['raw_risk_score'].dropna().values
+        if len(vals) > 0:
+            p70_val = float(np.percentile(vals, 70))
+            print(f"Ditemukan {len(vals):,} baris data referensi Q{curr_q} {ref_year}. Ambang P70: {p70_val:.8f}")
+            return p70_val
+
+    start_yr, end_yr = f"{ref_year}-01-01", f"{ref_year}-12-31"
+    print(f"Kuartal kosong, mengambil data referensi tahun penuh {ref_year} dari Supabase...")
+    all_rows_yr = []
+    start_idx = 0
+    while True:
+        resp = supabase_client.table("vessel_detections") \
+            .select("raw_risk_score") \
+            .gte("pass_date", start_yr) \
+            .lte("pass_date", end_yr) \
+            .range(start_idx, start_idx + page_size - 1) \
+            .execute()
+        batch = resp.data if resp.data else []
+        if not batch:
+            break
+        all_rows_yr.extend(batch)
+        if len(batch) < page_size:
+            break
+        start_idx += page_size
+
+    if all_rows_yr:
+        vals_yr = pd.DataFrame(all_rows_yr)['raw_risk_score'].dropna().values
+        if len(vals_yr) > 0:
+            p70_val = float(np.percentile(vals_yr, 70))
+            print(f"Ditemukan {len(vals_yr):,} baris data tahun {ref_year}. Ambang P70: {p70_val:.8f}")
+            return p70_val
+
+    resp_all = supabase_client.table("vessel_detections").select("raw_risk_score").limit(5000).execute()
+    if resp_all.data:
+        vals_all = pd.DataFrame(resp_all.data)['raw_risk_score'].dropna().values
+        if len(vals_all) > 0:
+            p70_val = float(np.percentile(vals_all, 70))
+            print(f"Ditemukan {len(vals_all):,} baris sampel Supabase. Ambang P70: {p70_val:.8f}")
+            return p70_val
+
+    raise ValueError("Tidak dapat menghitung threshold P70 dari data Supabase vessel_detections.")
+
+def scrape_gee_daily(target_date: datetime.date) -> pd.DataFrame:
+    import ee
+    init_gee()
+
+    wpp711_geom = ee.Geometry.Rectangle([102.90, -4.16, 111.05, 7.74])
+    date_start = target_date.strftime("%Y-%m-%d")
+    date_end = (target_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    print(f"Mengekstrak citra satelit Sentinel-1 GRD IW untuk WPP 711 pada tanggal: {date_start}")
+
+    s1 = (
+        ee.ImageCollection('COPERNICUS/S1_GRD')
+        .filterBounds(wpp711_geom)
+        .filterDate(date_start, date_end)
+        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    )
+
+    n_scene = s1.size().getInfo()
+    print(f"Total scene Sentinel-1 GRD IW ditemukan pada {date_start}: {n_scene} scene.")
+    if n_scene == 0:
         return pd.DataFrame()
 
-def scrape_gee_fallback(target_date: datetime.date) -> pd.DataFrame:
-    print(f"Mengambil data GEE fallback untuk tanggal: {target_date}")
-    try:
-        import ee
-        ee_service_account = os.environ.get("EE_SERVICE_ACCOUNT")
-        ee_private_key = os.environ.get("EE_PRIVATE_KEY")
-        ee_project = os.environ.get("EE_PROJECT", "darvin-natuna-2025")
-        
-        if ee_service_account and ee_private_key:
-            print("Autentikasi GEE via Service Account.")
-            credentials = ee.ServiceAccountCredentials(ee_service_account, key_data=ee_private_key)
-            ee.Initialize(credentials, project=ee_project)
-        else:
-            print("Autentikasi GEE via default credentials.")
-            try:
-                ee.Initialize(project=ee_project)
-            except Exception:
-                ee.Authenticate()
-                ee.Initialize(project=ee_project)
-            
-        wpp711_geom = ee.Geometry.Rectangle([102.90, -4.16, 111.05, 7.74])
-        date_str = target_date.strftime("%Y-%m-%d")
-        next_date_str = (target_date + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        col = (ee.ImageCollection('COPERNICUS/S1_GRD')
-               .filterBounds(wpp711_geom)
-               .filterDate(date_str, next_date_str)
-               .filter(ee.Filter.eq('instrumentMode', 'IW'))
-               .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-               .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH')))
-               
-        n_scene = col.size().getInfo()
-        if n_scene == 0:
-            print("Tidak ada scene Sentinel-1 GRD IW di GEE pada tanggal ini.")
-            return pd.DataFrame()
-            
-        print(f"Ditemukan {n_scene} scene Sentinel-1 di GEE.")
-        scene_list = col.toList(n_scene)
-        raw_candidates = []
-        
-        for i in range(n_scene):
-            img = ee.Image(scene_list.get(i))
+    scenes = s1.toList(n_scene)
+    all_detections = []
+
+    for i in range(n_scene):
+        try:
+            t0_scene = time.time()
+            img = ee.Image(scenes.get(i))
             scene_id = img.get('system:index').getInfo()
-            tgl_scene = img.date().format('YYYY-MM-dd HH:mm:ss').getInfo()
-            
+            timestamp_str = img.date().format('YYYY-MM-dd HH:mm:ss').getInfo()
+
+            print(f"[{i+1}/{n_scene}] Memproses scene {scene_id} ({timestamp_str})...")
+
             vv = img.select('VV')
-            kandidat_mask = vv.gt(-3.0)
-            blob = kandidat_mask.selfMask().connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=32)
-            ukuran_blob = blob.select('labels').connectedPixelCount(maxSize=32)
-            blob_valid = blob.updateMask(ukuran_blob.gte(2).And(ukuran_blob.lte(20)))
-            area_irisan = img.geometry().intersection(wpp711_geom, ee.ErrorMargin(1))
-            
-            vektor = blob_valid.select('labels').reduceToVectors(
-                geometry=area_irisan, scale=40, geometryType='centroid', maxPixels=1e9, bestEffort=True
+            mask = vv.gt(-3.0)
+            blob = mask.selfMask().connectedComponents(
+                connectedness=ee.Kernel.plus(1),
+                maxSize=32
             )
-            fitur_list = vektor.limit(3000).getInfo()['features']
-            
-            for f in fitur_list:
-                lon, lat = f['geometry']['coordinates']
-                raw_candidates.append({
+            ukuran = blob.select('labels').connectedPixelCount(maxSize=32)
+            blob_valid = blob.updateMask(ukuran.gte(2).And(ukuran.lte(20)))
+
+            area_irisan = img.geometry().intersection(wpp711_geom, ee.ErrorMargin(1))
+            vektor = blob_valid.select('labels').reduceToVectors(
+                geometry=area_irisan,
+                scale=40,
+                geometryType='centroid',
+                maxPixels=1e9,
+                bestEffort=True
+            )
+
+            feats = vektor.limit(3000).getInfo().get('features', [])
+            if not feats:
+                print(f"[{i+1}/{n_scene}] Scene {scene_id}: 0 kandidat terdeteksi.")
+                continue
+
+            raw_points = []
+            for feat in feats:
+                coords = feat['geometry']['coordinates']
+                raw_points.append({
                     'scene_id': scene_id,
-                    'timestamp': tgl_scene,
-                    'pass_date': date_str,
-                    'lat': lat,
-                    'lon': lon,
-                    'img_ref': img
+                    'timestamp': timestamp_str,
+                    'pass_date': date_start,
+                    'lat': coords[1],
+                    'lon': coords[0]
                 })
-                
-        if not raw_candidates:
-            return pd.DataFrame()
-            
-        df_cand = pd.DataFrame(raw_candidates)
-        
-        VESSEL_BUFFER_M, BG_INNER_M, BG_OUTER_M = 400, 200, 800
-        extracted_rows = []
-        
-        for s_id in df_cand['scene_id'].unique():
-            df_sub = df_cand[df_cand['scene_id'] == s_id].reset_index(drop=True)
-            img_s1 = df_sub.iloc[0]['img_ref'].select(['VV', 'VH'])
-            
-            fc_vessel = ee.FeatureCollection([
-                ee.Feature(ee.Geometry.Point([row['lon'], row['lat']]).buffer(VESSEL_BUFFER_M), {'row_idx': idx})
-                for idx, row in df_sub.iterrows()
-            ])
-            fc_bg = ee.FeatureCollection([
-                ee.Feature(
-                    ee.Geometry.Point([row['lon'], row['lat']]).buffer(BG_OUTER_M)
-                    .difference(ee.Geometry.Point([row['lon'], row['lat']]).buffer(BG_INNER_M)),
-                    {'row_idx': idx}
-                ) for idx, row in df_sub.iterrows()
-            ])
-            
-            v_stats = img_s1.reduceRegions(collection=fc_vessel, reducer=ee.Reducer.mean(), scale=10)
-            bg_stats = img_s1.select('VV').reduceRegions(collection=fc_bg, reducer=ee.Reducer.mean(), scale=10)
-            
-            v_map = {f['properties']['row_idx']: f['properties'] for f in v_stats.toList(v_stats.size()).getInfo()}
-            bg_map = {f['properties']['row_idx']: f['properties'] for f in bg_stats.toList(bg_stats.size()).getInfo()}
-            
-            for idx, row in df_sub.iterrows():
-                v = v_map.get(idx, {})
-                bg = bg_map.get(idx, {})
-                vv_val = v.get('VV', np.nan)
-                vh_val = v.get('VH', np.nan)
-                bg_val = bg.get('mean', np.nan)
-                vv_vh = (vv_val - vh_val) if (vv_val is not None and vh_val is not None) else 0.0
-                snr = (vv_val - bg_val) if (vv_val is not None and bg_val is not None) else 0.0
-                
-                row_dict = row.to_dict()
-                row_dict.pop('img_ref', None)
-                row_dict.update({
-                    'vv_intensity_db': vv_val,
-                    'vh_intensity_db': vh_val,
-                    'vv_vh_ratio': vv_vh,
-                    'radar_intensity_diff': vv_vh,
-                    'background_clutter': bg_val,
-                    'snr_db': snr
-                })
-                extracted_rows.append(row_dict)
-                
-        return pd.DataFrame(extracted_rows)
-    except Exception as e:
-        print(f"Error GEE Fallback: {e}")
+
+            df_pts = pd.DataFrame(raw_points)
+            total_pts = len(df_pts)
+            print(f"[{i+1}/{n_scene}] Scene {scene_id}: {total_pts} kandidat titik terdeteksi, mengekstrak polarimetri...")
+
+            CHUNK_SIZE = 100
+            total_chunks = (total_pts + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+            for chunk_idx, start_idx in enumerate(range(0, total_pts, CHUNK_SIZE)):
+                df_chunk = df_pts.iloc[start_idx:start_idx + CHUNK_SIZE].copy().reset_index(drop=True)
+
+                features_vessel = []
+                for r_idx, row in df_chunk.iterrows():
+                    pt = ee.Feature(ee.Geometry.Point([row['lon'], row['lat']]).buffer(400), {'row_idx': r_idx})
+                    features_vessel.append(pt)
+                fc_vessel = ee.FeatureCollection(features_vessel)
+
+                features_bg = []
+                for r_idx, row in df_chunk.iterrows():
+                    pt = ee.Feature(
+                        ee.Geometry.Point([row['lon'], row['lat']]).buffer(800)
+                        .difference(ee.Geometry.Point([row['lon'], row['lat']]).buffer(200)),
+                        {'row_idx': r_idx}
+                    )
+                    features_bg.append(pt)
+                fc_bg = ee.FeatureCollection(features_bg)
+
+                vessel_stats = img.select(['VV', 'VH']).reduceRegions(collection=fc_vessel, reducer=ee.Reducer.mean(), scale=10)
+                bg_stats = img.select('VV').reduceRegions(collection=fc_bg, reducer=ee.Reducer.mean(), scale=10)
+
+                v_list = vessel_stats.toList(len(df_chunk)).getInfo()
+                bg_list = bg_stats.toList(len(df_chunk)).getInfo()
+
+                v_map = {f['properties']['row_idx']: f['properties'] for f in v_list}
+                bg_map = {f['properties']['row_idx']: f['properties'] for f in bg_list}
+
+                for r_idx, row in df_chunk.iterrows():
+                    v = v_map.get(r_idx, {})
+                    bg = bg_map.get(r_idx, {})
+                    vv_val = v.get('VV')
+                    vh_val = v.get('VH')
+                    bg_val = bg.get('mean')
+
+                    if vv_val is not None and vh_val is not None and bg_val is not None:
+                        vv_vh_ratio = float(vv_val - vh_val)
+                        snr = float(vv_val - bg_val)
+                        all_detections.append({
+                            'scene_id': scene_id,
+                            'timestamp': timestamp_str,
+                            'pass_date': date_start,
+                            'lat': row['lat'],
+                            'lon': row['lon'],
+                            'vv_intensity_db': float(vv_val),
+                            'vh_intensity_db': float(vh_val),
+                            'radar_intensity_diff': vv_vh_ratio,
+                            'vv_vh_ratio': vv_vh_ratio,
+                            'background_clutter': float(bg_val),
+                            'snr_db': snr,
+                            'is_dark': 1,
+                            'ais_flag_country': 'UNKNOWN',
+                            'ais_flag_country_encoded': 15
+                        })
+
+                print(f"   Chunk {chunk_idx+1}/{total_chunks}: {min(start_idx + CHUNK_SIZE, total_pts)}/{total_pts} titik polarimetri selesai diekstrak.")
+
+            print(f"[{i+1}/{n_scene}] Scene {scene_id} selesai dalam {time.time() - t0_scene:.1f} detik.")
+
+        except Exception as e:
+            print(f"[{i+1}/{n_scene}] Melewati scene karena error: {e}")
+
+    df_out = pd.DataFrame(all_detections)
+    if df_out.empty:
+        return df_out
+
+    df_out = df_out.drop_duplicates(subset=['scene_id', 'lat', 'lon']).reset_index(drop=True)
+    print(f"Total kandidat polarimetri sebelum filter: {len(df_out):,} titik.")
+
+    print(f"Menjalankan filter noise Isolation Forest langsung pada hasil ekstraksi radar...")
+    iforest = load_model_file("isolation_forest")
+    fitur_anomali = ['vv_intensity_db', 'vh_intensity_db', 'vv_vh_ratio', 'background_clutter', 'snr_db']
+    
+    df_eval = df_out[fitur_anomali].dropna()
+    if df_eval.empty:
+        print("Seluruh kandidat memiliki nilai polarimetri kosong.")
         return pd.DataFrame()
 
-def load_vessel_data(target_date: datetime.date):
-    df_gfw = asyncio.run(scrape_gfw_async(target_date))
-    if not df_gfw.empty:
-        print(f"Data GFW termuat: {len(df_gfw)} deteksi.")
-        return df_gfw, "GFW"
-        
-    print("Data GFW kosong, beralih ke GEE fallback.")
-    df_gee = scrape_gee_fallback(target_date)
-    if not df_gee.empty:
-        print(f"Data GEE termuat: {len(df_gee)} kandidat kapal.")
-        return df_gee, "GEE"
-        
-    print("Tidak ada deteksi kapal dari GFW maupun GEE.")
-    return pd.DataFrame(), "NONE"
+    preds_anom = iforest.predict(df_eval)
+    df_filtered = df_out.loc[df_eval.index].copy()
+    df_filtered['is_vessel'] = (preds_anom == 1).astype(int)
+    df_clean_vessels = df_filtered[df_filtered['is_vessel'] == 1].reset_index(drop=True)
+
+    n_lolos = len(df_clean_vessels)
+    n_dibuang = len(df_filtered) - n_lolos
+    pct_lolos = (n_lolos / len(df_filtered)) * 100 if len(df_filtered) > 0 else 0.0
+    print(f"Filter Isolation Forest selesai: {n_lolos:,} kapal terkonfirmasi lolos ({pct_lolos:.1f}%), {n_dibuang:,} noise clutter dibuang.")
+
+    return df_clean_vessels
+
+def fill_holes(geom):
+    if geom.geom_type == 'Polygon':
+        return Polygon(geom.exterior)
+    elif geom.geom_type == 'MultiPolygon':
+        return MultiPolygon([Polygon(p.exterior) for p in geom.geoms])
+    return geom
 
 def haversine_km_vectorized(lat1, lon1, lat2_arr, lon2_arr):
     R = 6371.0
-    lat1, lon1 = np.radians(lat1), np.radians(lon1)
-    lat2_arr, lon2_arr = np.radians(lat2_arr), np.radians(lon2_arr)
-    dlat = lat2_arr - lat1
-    dlon = lon2_arr - lon1
-    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2_arr) * np.sin(dlon/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return R * c
+    lat1_r, lon1_r = np.radians(lat1), np.radians(lon1)
+    lat2_r, lon2_r = np.radians(lat2_arr), np.radians(lon2_arr)
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+    a = np.sin(dlat / 2.0)**2 + np.cos(lat1_r) * np.cos(lat2_r) * np.sin(dlon / 2.0)**2
+    return R * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
 
-def integrate_spatial_and_temporal(df: pd.DataFrame, target_date: datetime.date) -> pd.DataFrame:
-    if df.empty: return df
-    print("Menghitung fitur spasial dan lingkungan.")
-    
-    spatial_cache_dir = "automation/spatial"
+def compute_dist_to_seizure(lat_arr, lon_arr, seiz_lat, seiz_lon):
+    lat_r = np.radians(lat_arr)[:, None]
+    lon_r = np.radians(lon_arr)[:, None]
+    seiz_lat_r = np.radians(seiz_lat)[None, :]
+    seiz_lon_r = np.radians(seiz_lon)[None, :]
+
+    dlat = seiz_lat_r - lat_r
+    dlon = seiz_lon_r - lon_r
+    a = np.sin(dlat / 2.0)**2 + np.cos(lat_r) * np.cos(seiz_lat_r) * np.sin(dlon / 2.0)**2
+    dists_matrix = 2.0 * 6371.0088 * np.arcsin(np.sqrt(a))
+    dists_sorted = np.sort(dists_matrix, axis=1)
+    min_dists = np.where(
+        dists_sorted[:, 0] < 0.05,
+        np.where(dists_sorted.shape[1] > 1, dists_sorted[:, 1], -1.0),
+        dists_sorted[:, 0]
+    )
+    return np.round(min_dists, 4)
+
+def ensure_spatial_bundle():
+    spatial_cache_dir = os.path.join("automation", "spatial")
     os.makedirs(spatial_cache_dir, exist_ok=True)
-    zip_path = os.path.join(spatial_cache_dir, "poseidon_spatial.zip")
-    extract_dir = os.path.join(spatial_cache_dir, "poseidon_spatial_data")
     
-    if not os.path.exists(extract_dir):
-        print("Mengunduh data referensi spasial.")
-        import gdown, zipfile
-        gdown.download(id="1Hi05v9z0o397NGZer0YxcEwISpNzrne9", output=zip_path, quiet=True)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
-            
-    ports = pd.read_csv(os.path.join(extract_dir, "ports", "fishing_ports_wpp711.csv"))
-    seizures = pd.read_csv(os.path.join(extract_dir, "labels", "iuu_seizure_records_2023_2025.csv"))
-    mpa = gpd.read_file(os.path.join(extract_dir, "shapefiles", "mpa_wpp711.shp"))
-    eez = gpd.read_file(os.path.join(extract_dir, "shapefiles", "zee_wpp711.shp"))
-    
-    lat_col = 'Latitude' if 'Latitude' in ports.columns else 'lat'
-    lon_col = 'Longitude' if 'Longitude' in ports.columns else 'lon'
-    ports_lat, ports_lon = ports[lat_col].values, ports[lon_col].values
-    seiz_lat, seiz_lon = seizures['lat'].values, seizures['lon'].values
-    
-    mpa_union = mpa.geometry.unary_union
-    eez_union = eez.geometry.unary_union
-    
-    dist_mpa, dist_eez, dist_port, dist_seiz = [], [], [], []
-    for _, row in df.iterrows():
-        lat, lon = row['lat'], row['lon']
-        pt = Point(lon, lat)
-        dist_port.append(haversine_km_vectorized(lat, lon, ports_lat, ports_lon).min())
-        dist_seiz.append(haversine_km_vectorized(lat, lon, seiz_lat, seiz_lon).min())
-        pt_gdf = gpd.GeoSeries([pt], crs="EPSG:4326")
-        dist_mpa.append(pt_gdf.distance(mpa_union).min() * 111.0)
-        dist_eez.append(pt_gdf.distance(eez_union).min() * 111.0)
-        
-    df['dist_to_nearest_mpa_km'] = dist_mpa
-    df['dist_to_eez_boundary_km'] = dist_eez
-    df['dist_to_nearest_port_km'] = dist_port
-    df['dist_to_nearest_seizure_km'] = dist_seiz
-    
-    df['grid_lat'] = np.floor(df['lat'] / 0.25) * 0.25
-    df['grid_lon'] = np.floor(df['lon'] / 0.25) * 0.25
-    
+    spatial_base = os.path.join(spatial_cache_dir, "poseidon_spatial_data")
+    if not os.path.exists(spatial_base) or not os.path.exists(os.path.join(spatial_base, "shapefiles", "mpa_wpp711.shp")):
+        target_zip = os.path.join(spatial_cache_dir, "poseidon_spatial.zip")
+        import gdown
+        print("Mengunduh bundle shapefile spasial dari Google Drive (ID 1Hi05v9z0o397NGZer0YxcEwISpNzrne9)...")
+        gdown.download(id='1Hi05v9z0o397NGZer0YxcEwISpNzrne9', output=target_zip, quiet=True)
+        if os.path.exists(target_zip):
+            print("Mengekstrak bundle shapefile spasial...")
+            with zipfile.ZipFile(target_zip, 'r') as zip_ref:
+                zip_ref.extractall(spatial_base)
+
+    return spatial_base
+
+def load_hotspot_grids():
+    cache_path = os.path.join("automation", "spatial", "historical_hotspot_grids.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    temp_csv = os.path.join("automation", "temp_hist.csv")
+    try:
+        import gdown
+        print("Mengunduh dataset referensi hotspot dari Google Drive (ID 19L7mhcy_tjy9XYrLm5Gy-uXTKyfEQVMo)...")
+        gdown.download(id="19L7mhcy_tjy9XYrLm5Gy-uXTKyfEQVMo", output=temp_csv, quiet=True)
+        if os.path.exists(temp_csv):
+            df_h = pd.read_csv(temp_csv, usecols=['lat', 'lon', 'historical_hotspot'])
+            df_h['grid_lat'] = (df_h['lat'] // 0.1).astype(int)
+            df_h['grid_lon'] = (df_h['lon'] // 0.1).astype(int)
+            hotspots = df_h[df_h['historical_hotspot'] == 1][['grid_lat', 'grid_lon']].drop_duplicates().values.tolist()
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(hotspots, f)
+            if os.path.exists(temp_csv):
+                os.remove(temp_csv)
+            return hotspots
+    except Exception:
+        pass
+
+    raise FileNotFoundError("Gagal memuat historical_hotspot_grids dari remote source.")
+
+def integrate_spatial_and_temporal_gee(df: pd.DataFrame, target_date: datetime.date) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    print(f"Mengintegrasikan fitur spasial GIS & oseanografi untuk {len(df):,} deteksi kapal...")
+    spatial_base = ensure_spatial_bundle()
+    spatial_cache_dir = os.path.join("automation", "spatial")
+
+    shp_dir = os.path.join(spatial_base, "shapefiles")
+    if not os.path.exists(shp_dir):
+        shp_dir = spatial_base
+
+    ports_csv = os.path.join(spatial_base, "ports", "fishing_ports_wpp711.csv")
+    if not os.path.exists(ports_csv):
+        ports_csv = os.path.join(spatial_base, "fishing_ports_wpp711.csv")
+
+    seiz_csv = os.path.join(spatial_base, "labels", "iuu_seizure_records_2023_2025.csv")
+    if not os.path.exists(seiz_csv):
+        seiz_csv = os.path.join(spatial_base, "iuu_seizure_records_2023_2025.csv")
+
+    mpa_shp = os.path.join(shp_dir, "mpa_wpp711.shp")
+    eez_shp = os.path.join(shp_dir, "zee_wpp711.shp")
+
+    gdf_mpa = gpd.read_file(mpa_shp).to_crs('EPSG:4326')
+    gdf_eez = gpd.read_file(eez_shp).to_crs('EPSG:4326')
+    gdf_eez['geometry'] = gdf_eez.geometry.apply(fill_holes)
+    df_ports = pd.read_csv(ports_csv)
+    df_seiz = pd.read_csv(seiz_csv)
+
+    print("Menghitung jarak bertanda Kawasan Konservasi (MPA) & Batas ZEE...")
+    gdf_points = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df['lon'], df['lat']),
+        crs='EPSG:4326'
+    )
+    gdf_points_proj = gdf_points.to_crs('EPSG:3857')
+
+    mpa_proj = gdf_mpa.to_crs('EPSG:3857')
+    eez_proj = gdf_eez.to_crs('EPSG:3857')
+
+    mpa_centroid_coords = np.array([(c.x, c.y) for c in mpa_proj.geometry.centroid if hasattr(c, 'x')])
+    mpa_tree = cKDTree(mpa_centroid_coords)
+
+    ports_lat, ports_lon = df_ports['lat'].values, df_ports['lon'].values
+
+    dist_mpa_list = []
+    dist_eez_list = []
+    dist_port_list = []
+
+    for _, row in gdf_points_proj.iterrows():
+        lat_val = float(row['lat'])
+        lon_val = float(row['lon'])
+        point_geom = row['geometry']
+        point_xy = np.array([point_geom.x, point_geom.y])
+
+        _, closest_indices = mpa_tree.query(point_xy, k=min(5, len(mpa_centroid_coords)))
+        if isinstance(closest_indices, (int, np.integer)):
+            closest_indices = [closest_indices]
+        candidates = mpa_proj.iloc[closest_indices]
+
+        distances_mpa_m = candidates.boundary.distance(point_geom)
+        min_dist_mpa_m = float(distances_mpa_m.min())
+        inside_mpa = bool(candidates.contains(point_geom).any())
+        d_mpa = -min_dist_mpa_m / 1000.0 if inside_mpa else min_dist_mpa_m / 1000.0
+
+        dist_eez_m = float(eez_proj.boundary.distance(point_geom).min())
+        inside_eez = bool(eez_proj.contains(point_geom).any())
+        d_eez = -dist_eez_m / 1000.0 if not inside_eez else dist_eez_m / 1000.0
+
+        d_port = float(haversine_km_vectorized(lat_val, lon_val, ports_lat, ports_lon).min())
+
+        dist_mpa_list.append(round(d_mpa, 2))
+        dist_eez_list.append(round(d_eez, 2))
+        dist_port_list.append(round(d_port, 2))
+
+    df['dist_to_nearest_mpa_km'] = dist_mpa_list
+    df['dist_to_eez_boundary_km'] = dist_eez_list
+    df['dist_to_nearest_port_km'] = dist_port_list
+
+    print("Menghitung jarak Haversine ke titik penangkapan IUU historis...")
+    seiz_dated = df_seiz.copy()
+    if 'date' in seiz_dated.columns:
+        seiz_dated['date'] = pd.to_datetime(seiz_dated['date'])
+        seiz_dated['year'] = seiz_dated['date'].dt.year
+        in_bbox = (
+            seiz_dated['lon'].between(102.90, 111.05) &
+            seiz_dated['lat'].between(-4.16, 7.74)
+        )
+        df_seiz_ref = seiz_dated[in_bbox & (seiz_dated['year'] <= 2025)].copy() if 'year' in seiz_dated.columns else seiz_dated[in_bbox].copy()
+    else:
+        df_seiz_ref = seiz_dated.copy()
+
+    seiz_lat = df_seiz_ref['lat'].values
+    seiz_lon = df_seiz_ref['lon'].values
+    df['dist_to_nearest_seizure_km'] = compute_dist_to_seizure(df['lat'].values, df['lon'].values, seiz_lat, seiz_lon)
+
+    df['grid_lat'] = np.floor(df['lat'] / 0.1).astype(int)
+    df['grid_lon'] = np.floor(df['lon'] / 0.1).astype(int)
+
     grid_env_path = os.path.join(spatial_cache_dir, "wpp711_grid_environmental_full.csv")
     if not os.path.exists(grid_env_path):
         import gdown
+        print("Mengunduh dataset grid parameter oseanografi dari Google Drive (ID 1yreRiRL8w0cJ8NYAZTDs2ILa61dJFhrX)...")
         gdown.download(id='1yreRiRL8w0cJ8NYAZTDs2ILa61dJFhrX', output=grid_env_path, quiet=True)
-    if os.path.exists(grid_env_path):
-        grid_env = pd.read_csv(grid_env_path)
-        env_cols = ['grid_lat', 'grid_lon', 'bathymetry', 'sst_mean', 'sst_std', 'current_speed_mean', 'current_speed_std', 'chlorophyll_mean']
-        env_cols = [c for c in env_cols if c in grid_env.columns]
-        df = df.merge(grid_env[env_cols], on=['grid_lat', 'grid_lon'], how='left')
-    
-    env_fallbacks = {'bathymetry': -50.0, 'sst_mean': 29.5, 'sst_std': 0.5, 'current_speed_mean': 0.35, 'current_speed_std': 0.1, 'chlorophyll_mean': 0.25}
-    for col, val in env_fallbacks.items():
-        if col not in df.columns: df[col] = val
-        df[col] = df[col].fillna(val)
-        
-    df['historical_hotspot'] = 0
-    df['quarter'] = int((target_date.month - 1) // 3 + 1)
-    return df
 
-def run_pipeline_scoring(df: pd.DataFrame, schema: str, target_date: datetime.date) -> pd.DataFrame:
-    if df.empty: return df
-    print(f"Menjalankan model scoring untuk skema: {schema}")
-    
-    model_len = load_hf_model("length_model")
-    model_fish = load_hf_model("fishing_model")
-    
-    if 'vv_vh_ratio' not in df.columns:
-        df['vv_vh_ratio'] = df['vv_intensity_db'] - df['vh_intensity_db']
-    if 'radar_intensity_diff' not in df.columns:
-        df['radar_intensity_diff'] = df['vv_vh_ratio']
-        
+    grid_env = pd.read_csv(grid_env_path)
+    env_cols = ['bathymetry', 'sst_mean', 'sst_std', 'current_speed_mean', 'current_speed_std', 'chlorophyll_mean']
+    env_cols_full = ['grid_lat', 'grid_lon'] + [c for c in env_cols if c in grid_env.columns]
+
+    print("Menggabungkan parameter batimetri, SST, arus, dan klorofil-a...")
+    df = df.merge(
+        grid_env[env_cols_full],
+        on=['grid_lat', 'grid_lon'],
+        how='left'
+    )
+
+    for col in env_cols:
+        if col in df.columns and col in grid_env.columns:
+            df[col] = df[col].fillna(float(grid_env[col].median()))
+
+    print("Mencocokkan zona rawan pelanggaran historis (850 hotspot grid)...")
+    hotspot_grids = load_hotspot_grids()
+    hotspot_set = set(tuple(g) for g in hotspot_grids)
+    df['historical_hotspot'] = df.apply(
+        lambda r: 1 if (int(r['grid_lat']), int(r['grid_lon'])) in hotspot_set else 0,
+        axis=1
+    )
+
+    df['quarter'] = int((target_date.month - 1) // 3 + 1)
+    df['is_dark'] = 1
+    df['ais_flag_country'] = 'UNKNOWN'
+    df['ais_flag_country_encoded'] = 15
+
+    return df.reset_index(drop=True)
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))
+
+def run_pipeline_scoring_gee(df: pd.DataFrame, target_date: datetime.date) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    print(f"Memulai inferensi model ML untuk {len(df):,} deteksi kapal...")
+
+    print("Mengestimasi panjang fisik kapal (Gradient Boosting Model)...")
+    model_len = load_model_file("length_model")
     len_features = ['vv_intensity_db', 'vh_intensity_db', 'vv_vh_ratio', 'radar_intensity_diff', 'snr_db', 'background_clutter']
-    for c in len_features:
-        if c not in df.columns: df[c] = 0.0
-        
-    df['length_m_new'] = model_len.predict(df[len_features])
-    df['length_m'] = df['length_m_new']
-    
+    df['length_m_new'] = np.clip(model_len.predict(df[len_features]), 5.0, 300.0)
+
+    print("Mengestimasi indeks aktivitas penangkapan ikan (XGBoost Estimator)...")
+    model_fish = load_model_file("fishing_model")
     fish_features = [
         'length_m_new', 'vv_intensity_db', 'vh_intensity_db', 'vv_vh_ratio',
         'bathymetry', 'sst_mean', 'sst_std', 'current_speed_mean',
         'current_speed_std', 'chlorophyll_mean', 'dist_to_nearest_port_km'
     ]
-    for c in fish_features:
-        if c not in df.columns: df[c] = 0.0
-        
-    df['fishing_score_new'] = np.clip(model_fish.predict(df[fish_features]), 0, 1)
-    df['fishing_score'] = df['fishing_score_new']
-    
-    if schema == "GEE":
-        print("Menjalankan filter Isolation Forest untuk kandidat GEE.")
-        iforest = load_hf_model("isolation_forest")
-        if hasattr(iforest, 'feature_names_in_'):
-            fitur_anomali = list(iforest.feature_names_in_)
-        else:
-            fitur_anomali = ['vv_intensity_db', 'vh_intensity_db', 'radar_intensity_diff', 'background_clutter', 'snr_db']
-        for col in fitur_anomali:
-            if col not in df.columns: df[col] = 0.0
-            
-        preds_anom = iforest.predict(df[fitur_anomali])
-        df['is_vessel'] = (preds_anom == 1).astype(int)
-        df = df[df['is_vessel'] == 1].reset_index(drop=True)
-        if df.empty:
-            print("Seluruh kandidat tereliminasi sebagai noise oleh Isolation Forest.")
-            return df
-            
-        pipeline_models = load_hf_model("gee_models")
-    else:
-        if 'matching_score' not in df.columns: df['matching_score'] = 0.0
-        if 'ais_flag_country_encoded' not in df.columns: df['ais_flag_country_encoded'] = 0
-        pipeline_models = load_hf_model("gfw_models")
-        
+    df['fishing_score_new'] = np.clip(model_fish.predict(df[fish_features]), 0.0, 1.0)
+
+    print("Menjalankan inferensi model ensemble PU-Learning GEE (13 Fitur)...")
+    pipeline_models = load_model_file("gee_models")
     feature_cols = pipeline_models['features']
-    for col in feature_cols:
-        if col not in df.columns: df[col] = 0.0
-        
+
+    missing_features = [c for c in feature_cols if c not in df.columns]
+    if missing_features:
+        raise ValueError(f"Fitur wajib untuk GEE model tidak lengkap: {missing_features}.")
+
     X = df[feature_cols].astype(np.float32)
-    w_lgb = float(pipeline_models.get('w_lgb', 0.5))
-    
+    w_lgb = float(pipeline_models['w_lgb'])
+
     lgb_preds = np.mean([_sigmoid(m.predict(X, raw_score=True)) for m in pipeline_models['models_lgb']], axis=0)
-    
+
     import xgboost as xgb
     dtest = xgb.DMatrix(X)
     xgb_preds = np.mean([_sigmoid(m.predict(dtest, output_margin=True)) for m in pipeline_models['models_xgb']], axis=0)
-    
+
     raw_scores = w_lgb * lgb_preds + (1.0 - w_lgb) * xgb_preds
     df['raw_risk_score'] = raw_scores
     batch_min, batch_max = float(raw_scores.min()), float(raw_scores.max())
     df['risk_score'] = (raw_scores - batch_min) / (batch_max - batch_min + 1e-9)
 
-    thr = get_reference_thresholds(target_date)
-    if thr is None:
-        q75_raw, q90_raw = float(np.percentile(raw_scores, 75)), float(np.percentile(raw_scores, 90))
-        q_hat_raw = q90_raw
-    else:
-        q75_raw, q90_raw = float(thr['q75']), float(thr['q90'])
-        q_hat_raw = float(thr.get('q_hat', q90_raw))
+    q_hat = float(pipeline_models['q_hat'])
+    df['conformal_flag'] = (raw_scores >= q_hat).astype(int)
 
-    df['status_siaga'] = np.select(
-        [raw_scores >= q90_raw, (raw_scores >= q75_raw) & (raw_scores < q90_raw)],
-        ['SIAGA 1 (Prioritas Verifikasi)', 'SIAGA 2 (Pengamatan Terarah)'],
-        default='SIAGA 3 (Pemantauan Pasif)'
-    )
-
-    df['conformal_flag'] = (raw_scores >= q_hat_raw).astype(int)
-    
-    df = df.sort_values(by='risk_score', ascending=False).reset_index(drop=True)
+    df = df.sort_values(by='raw_risk_score', ascending=False).reset_index(drop=True)
     df['rank_siklus'] = range(1, len(df) + 1)
-    
+
+    print("Menerapkan skema penentuan status Siaga baru berbasis kuartal referensi...")
+    p70_threshold = get_p70_quarter_reference_threshold(target_date)
+
+    status_list = []
+    for _, row in df.iterrows():
+        rk = int(row['rank_siklus'])
+        raw_sc = float(row['raw_risk_score'])
+        if rk in [1, 2, 3]:
+            if raw_sc >= p70_threshold:
+                status_list.append('SIAGA 1 (Prioritas)')
+            else:
+                status_list.append('SIAGA 1')
+        elif rk in [4, 5, 6]:
+            status_list.append('SIAGA 2')
+        elif rk in [7, 8, 9, 10]:
+            status_list.append('SIAGA 3')
+        else:
+            status_list.append('SIAGA 3 (Pasif)')
+    df['status_siaga'] = status_list
+
+    print("Mengekstrak kontribusi faktor risiko SHAP Tree Explainer untuk Top 10 target...")
     df['risk_factors_shap'] = ""
-    top10_indices = df.head(10).index
-    if len(top10_indices) > 0:
+    if len(df) > 0:
         model_lgb_ref = pipeline_models['models_lgb'][0]
-        X_top10 = X.loc[top10_indices]
+        X_sorted = df[feature_cols].astype(np.float32)
+        top10_indices = list(range(min(10, len(df))))
+        X_top10 = X_sorted.iloc[top10_indices]
         tree_contrib = model_lgb_ref.predict(X_top10, pred_contrib=True)[:, :-1]
         for i, idx in enumerate(top10_indices):
             contrib = tree_contrib[i]
@@ -553,74 +655,78 @@ def run_pipeline_scoring(df: pd.DataFrame, schema: str, target_date: datetime.da
                 arah = "menaikkan risiko" if cval > 0 else "menurunkan risiko"
                 reasons.append(f"{flbl} = {fval:.3f} ({arah}, kontribusi {cval:+.4f})")
             df.loc[idx, 'risk_factors_shap'] = " | ".join(reasons)
-            
+
     df['year'] = target_date.year
     if 'timestamp' not in df.columns or df['timestamp'].isnull().all():
         df['timestamp'] = f"{target_date.strftime('%Y-%m-%d')} 00:00:00+00:00"
-    if 'is_dark' not in df.columns:
-        df['is_dark'] = 1
-    if 'ais_flag_country' not in df.columns:
-        df['ais_flag_country'] = "UNKNOWN"
-        
+    df['is_dark'] = 1
+    df['ais_flag_country'] = "UNKNOWN"
+    df['ais_flag_country_encoded'] = 15
+
     return df
 
 def fetch_max_ids(supabase: Client):
-    max_id, max_seq = 0, 0
+    max_id, max_seq, max_top_id = 0, 0, 0
     try:
         res_id = supabase.table("vessel_detections").select("id").order("id", desc=True).limit(1).execute()
-        if res_id.data: max_id = int(res_id.data[0]['id'])
-    except Exception: pass
-    
+        if res_id.data:
+            max_id = int(res_id.data[0]['id'])
+    except Exception:
+        pass
+
     try:
         res_seq = supabase.table("satellite_passes").select("seq").order("seq", desc=True).limit(1).execute()
-        if res_seq.data: max_seq = int(res_seq.data[0]['seq'])
-    except Exception: pass
-    
-    return max_id, max_seq
+        if res_seq.data:
+            max_seq = int(res_seq.data[0]['seq'])
+    except Exception:
+        pass
+
+    try:
+        res_top_id = supabase.table("top10_priorities").select("id").order("id", desc=True).limit(1).execute()
+        if res_top_id.data:
+            max_top_id = int(res_top_id.data[0]['id'])
+    except Exception:
+        pass
+
+    return max_id, max_seq, max_top_id
 
 def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
     if df.empty:
-        print("Tidak ada data untuk diunggah ke Supabase.")
+        print("Data kosong, tidak ada baris yang diunggah.")
         return
-        
+
     supabase = get_supabase()
-    date_str = target_date.strftime("%Y-%m-%d")
+    max_id, max_seq, max_top_id = fetch_max_ids(supabase)
+    print(f"Supabase Max IDs: vessel_detections={max_id}, satellite_passes={max_seq}, top10_priorities={max_top_id}")
 
-    try:
-        supabase.table("vessel_detections").delete().eq("pass_date", date_str).execute()
-        supabase.table("top10_priorities").delete().eq("pass_date", date_str).execute()
-        supabase.table("satellite_passes").delete().eq("pass_date", date_str).execute()
-    except Exception as e:
-        print(f"Peringatan saat pembersihan data duplikat untuk {date_str}: {e}")
-
-    max_id, max_seq = fetch_max_ids(supabase)
-    print(f"Supabase Max ID: {max_id}, Max Seq: {max_seq}")
-    
     df['id'] = range(max_id + 1, max_id + 1 + len(df))
     vd_cols = [
         'id', 'pass_date', 'timestamp', 'lat', 'lon', 'risk_score', 'raw_risk_score',
         'status_siaga', 'rank_siklus', 'conformal_flag', 'risk_factors_shap',
         'length_m_new', 'fishing_score_new', 'vv_intensity_db', 'vh_intensity_db',
         'snr_db', 'dist_to_nearest_mpa_km', 'dist_to_eez_boundary_km',
-        'dist_to_nearest_port_km', 'dist_to_nearest_seizure_km', 'is_dark', 'ais_flag_country'
+        'dist_to_nearest_port_km', 'dist_to_nearest_seizure_km',
+        'is_dark', 'ais_flag_country', 'ais_flag_country_encoded'
     ]
     df_vd = df[[c for c in vd_cols if c in df.columns]].replace({np.nan: None})
     records_vd = df_vd.to_dict(orient="records")
-    
-    print(f"Mengunggah {len(records_vd)} baris ke vessel_detections.")
+
+    print(f"Mengunggah {len(records_vd):,} baris ke vessel_detections...")
     batch_size = 500
     for i in range(0, len(records_vd), batch_size):
         supabase.table("vessel_detections").upsert(records_vd[i:i+batch_size]).execute()
-        
-    df_top10 = df.sort_values(by='risk_score', ascending=False).head(10)
+        print(f"   Progress vessel_detections: {min(i+batch_size, len(records_vd))}/{len(records_vd)} baris.")
+
+    df_top10 = df.sort_values(by='raw_risk_score', ascending=False).head(10).copy()
+    df_top10['id'] = range(max_top_id + 1, max_top_id + 1 + len(df_top10))
     df_top10_push = df_top10[[c for c in vd_cols if c in df_top10.columns]].replace({np.nan: None})
     records_top10 = df_top10_push.to_dict(orient="records")
-    print(f"Mengunggah {len(records_top10)} baris prioritas ke top10_priorities.")
+    print(f"Mengunggah {len(records_top10)} target prioritas ke top10_priorities...")
     supabase.table("top10_priorities").upsert(records_top10).execute()
-    
+
     date_str = target_date.strftime("%Y-%m-%d")
     hour_val = str(df['timestamp'].iloc[0])[11:16] if 'timestamp' in df.columns else '00:00'
-    
+
     pass_record = {
         'seq': max_seq + 1,
         'pass_date': date_str,
@@ -628,42 +734,30 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         'month': int(target_date.month),
         'time': hour_val,
         'total_detections': int(len(df)),
-        'siaga_1_count': int((df['status_siaga'] == 'SIAGA 1 (Prioritas Verifikasi)').sum()),
-        'siaga_2_count': int((df['status_siaga'] == 'SIAGA 2 (Pengamatan Terarah)').sum()),
-        'siaga_3_count': int((df['status_siaga'] == 'SIAGA 3 (Pemantauan Pasif)').sum()),
+        'siaga_1_count': int((df['status_siaga'].isin(['SIAGA 1 (Prioritas)', 'SIAGA 1'])).sum()),
+        'siaga_2_count': int((df['status_siaga'] == 'SIAGA 2').sum()),
+        'siaga_3_count': int((df['status_siaga'].isin(['SIAGA 3', 'SIAGA 3 (Pasif)'])).sum()),
         'dark_count': int((df['is_dark'] == 1).sum())
     }
-    print("Mengunggah ringkasan lintasan ke satellite_passes.")
-    supabase.table("satellite_passes").upsert([pass_record]).execute()
-    print("Selesai mengunggah seluruh data ke Supabase.")
+    print(f"Mengunggah ringkasan siklus satelit ({date_str}) ke satellite_passes...")
+    supabase.table("satellite_passes").upsert([pass_record], on_conflict="pass_date").execute()
+    print("Selesai mengunggah seluruh data ke 3 tabel Supabase.")
 
-def check_date_exists_in_supabase(target_date: datetime.date) -> bool:
-    try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            return False
-        supabase = get_supabase()
-        date_str = target_date.strftime("%Y-%m-%d")
-        resp = supabase.table("satellite_passes").select("pass_date").eq("pass_date", date_str).limit(1).execute()
-        if resp.data and len(resp.data) > 0:
-            return True
-        return False
-    except Exception as e:
-        print(f"Peringatan: Gagal mengecek status tanggal di Supabase ({e}). Melanjutkan proses.")
-        return False
+def run_daily_automation(target_date: datetime.date = None):
+    if target_date is None:
+        target_date = datetime.date.today() - datetime.timedelta(days=2)
+
+    print(f"Memulai eksekusi harian POSEIDON GEE Pipeline untuk tanggal: {target_date}")
+    t_start = time.time()
+    df_raw = scrape_gee_daily(target_date)
+    if df_raw.empty:
+        print(f"Tidak ada deteksi kapal pada tanggal {target_date}.")
+        return
+
+    df_feat = integrate_spatial_and_temporal_gee(df_raw, target_date)
+    df_scored = run_pipeline_scoring_gee(df_feat, target_date)
+    push_results_to_supabase(df_scored, target_date)
+    print(f"Eksekusi pipeline harian untuk {target_date} selesai dengan sukses dalam {time.time() - t_start:.1f} detik.")
 
 if __name__ == "__main__":
-    target_date = datetime.date.today() - datetime.timedelta(days=2)
-    print(f"Eksekusi pipeline POSEIDON untuk tanggal: {target_date}")
-    
-    if check_date_exists_in_supabase(target_date):
-        print(f"Data untuk tanggal {target_date} sudah ada di Supabase. Eksekusi dilewati (tidak ada pemrosesan ulang).")
-    else:
-        df_raw, schema = load_vessel_data(target_date)
-        
-        if not df_raw.empty:
-            df_feat = integrate_spatial_and_temporal(df_raw, target_date)
-            df_scored = run_pipeline_scoring(df_feat, schema, target_date)
-            push_results_to_supabase(df_scored, target_date)
-            print("Pipeline harian selesai diproses.")
-        else:
-            print("Tidak ada data deteksi yang ditemukan untuk diproses.")
+    run_daily_automation()
