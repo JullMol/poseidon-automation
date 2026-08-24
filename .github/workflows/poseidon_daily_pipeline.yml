@@ -37,9 +37,11 @@ jobs:
       - name: Download Phase 3 & 4 Models from Hugging Face
         run: |
           mkdir -p automation/models
-          wget -O automation/models/poseidon_models.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/poseidon_models.pkl
-          wget -O automation/models/model_length_gb.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/model_length_gb.pkl
-          wget -O automation/models/model_fishing_score_xgboost.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/Pipeline_V2_2026/model_fishing_score_xgboost.pkl
+          wget -O automation/models/poseidon_models_gfw.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model/GFW/poseidon_models_gfw.pkl
+          wget -O automation/models/poseidon_models_gee.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model/GEE/poseidon_models_gee.pkl
+          wget -O automation/models/isolation_forest_model.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model/GEE/isolation_forest_model.pkl
+          wget -O automation/models/model_length_gb.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model/model_length_gb.pkl
+          wget -O automation/models/model_fishing_score_xgboost.pkl https://huggingface.co/JullMol/POSEIDON/resolve/main/POSEIDON_Model/model_fishing_score_xgboost.pkl
 
       - name: Execute POSEIDON Pipeline
         run: |
