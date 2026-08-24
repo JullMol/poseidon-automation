@@ -744,20 +744,54 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
     print("Selesai mengunggah seluruh data ke 3 tabel Supabase.")
 
 def run_daily_automation(target_date: datetime.date = None):
-    if target_date is None:
-        target_date = datetime.date.today() - datetime.timedelta(days=2)
+    if target_date is not None:
+        dates_to_check = [target_date]
+    else:
+        today = datetime.date.today()
+        dates_to_check = [today - datetime.timedelta(days=i) for i in range(3, 0, -1)]
 
-    print(f"Memulai eksekusi harian POSEIDON GEE Pipeline untuk tanggal: {target_date}")
-    t_start = time.time()
-    df_raw = scrape_gee_daily(target_date)
-    if df_raw.empty:
-        print(f"Tidak ada deteksi kapal pada tanggal {target_date}.")
+    supabase = get_supabase()
+    processed_dates = set()
+    
+    if not dates_to_check:
         return
 
-    df_feat = integrate_spatial_and_temporal_gee(df_raw, target_date)
-    df_scored = run_pipeline_scoring_gee(df_feat, target_date)
-    push_results_to_supabase(df_scored, target_date)
-    print(f"Eksekusi pipeline harian untuk {target_date} selesai dengan sukses dalam {time.time() - t_start:.1f} detik.")
+    try:
+        start_date_str = min(dates_to_check).strftime("%Y-%m-%d")
+        end_date_str = max(dates_to_check).strftime("%Y-%m-%d")
+        resp = supabase.table("satellite_passes") \
+            .select("pass_date") \
+            .gte("pass_date", start_date_str) \
+            .lte("pass_date", end_date_str) \
+            .execute()
+        if resp.data:
+            processed_dates = {row['pass_date'] for row in resp.data}
+    except Exception as e:
+        print(f"Gagal mengambil riwayat satellite_passes dari Supabase: {e}")
+
+    processed_any = False
+    for d in dates_to_check:
+        d_str = d.strftime("%Y-%m-%d")
+        if d_str in processed_dates:
+            print(f"Tanggal {d_str} sudah pernah diproses dan ada di Supabase, dilewati (Skip).")
+            continue
+
+        print(f"\nMemulai eksekusi POSEIDON GEE Pipeline untuk tanggal: {d_str}")
+        t_start = time.time()
+        df_raw = scrape_gee_daily(d)
+        
+        if df_raw.empty:
+            print(f"Tidak ada deteksi kapal / scene satelit pada tanggal {d_str} di GEE. (Akan dicek ulang esok hari jika masih dalam window 3 hari).")
+            continue
+
+        processed_any = True
+        df_feat = integrate_spatial_and_temporal_gee(df_raw, d)
+        df_scored = run_pipeline_scoring_gee(df_feat, d)
+        push_results_to_supabase(df_scored, d)
+        print(f"Eksekusi pipeline untuk {d_str} selesai dengan sukses dalam {time.time() - t_start:.1f} detik.")
+
+    if not processed_any and target_date is None:
+        print("\nTidak ada siklus satelit baru yang berhasil diproses hari ini (semua sudah up-to-date atau GEE belum update).")
 
 if __name__ == "__main__":
     run_daily_automation()
