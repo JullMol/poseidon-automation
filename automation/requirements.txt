@@ -9,4 +9,4 @@ gfw-api-python-client
 gdown
 geopandas
 shapely
-scikit-learn
+scikit-learn==1.8.0
