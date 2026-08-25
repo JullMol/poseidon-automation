@@ -414,8 +414,8 @@ def load_hotspot_grids():
     temp_csv = os.path.join("automation", "temp_hist.csv")
     try:
         import gdown
-        print("Mengunduh dataset referensi hotspot dari Google Drive (ID 19L7mhcy_tjy9XYrLm5Gy-uXTKyfEQVMo)...")
-        gdown.download(id="19L7mhcy_tjy9XYrLm5Gy-uXTKyfEQVMo", output=temp_csv, quiet=True)
+        print("Mengunduh dataset referensi hotspot dari Google Drive (ID 1UO5VX9B4Rps4MwjEOpseNQZ-xuMAZ-wv)...")
+        gdown.download(id="1UO5VX9B4Rps4MwjEOpseNQZ-xuMAZ-wv", output=temp_csv, quiet=True)
         if os.path.exists(temp_csv):
             df_h = pd.read_csv(temp_csv, usecols=['lat', 'lon', 'historical_hotspot'])
             df_h['grid_lat'] = (df_h['lat'] // 0.1).astype(int)
