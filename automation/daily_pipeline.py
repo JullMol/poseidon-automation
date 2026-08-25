@@ -718,7 +718,7 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         print(f"   Progress vessel_detections: {min(i+batch_size, len(records_vd))}/{len(records_vd)} baris.")
 
     df_top10 = df.sort_values(by='raw_risk_score', ascending=False).head(10).copy()
-    df_top10['id'] = range(max_top_id + 1, max_top_id + 1 + len(df_top10))
+    # Menggunakan ID yang sama dengan vessel_detections agar tersinkronisasi 1:1
     df_top10_push = df_top10[[c for c in vd_cols if c in df_top10.columns]].replace({np.nan: None})
     records_top10 = df_top10_push.to_dict(orient="records")
     print(f"Mengunggah {len(records_top10)} target prioritas ke top10_priorities...")
