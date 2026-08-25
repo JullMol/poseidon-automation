@@ -696,6 +696,15 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         return
 
     supabase = get_supabase()
+    date_str = target_date.strftime("%Y-%m-%d")
+
+    print(f"Memastikan tidak ada duplikasi data parsial untuk {date_str} di Supabase...")
+    try:
+        supabase.table("vessel_detections").delete().eq("pass_date", date_str).execute()
+        supabase.table("top10_priorities").delete().eq("pass_date", date_str).execute()
+    except Exception as e:
+        pass
+
     max_id, max_seq, max_top_id = fetch_max_ids(supabase)
     print(f"Supabase Max IDs: vessel_detections={max_id}, satellite_passes={max_seq}, top10_priorities={max_top_id}")
 
@@ -718,7 +727,6 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         print(f"   Progress vessel_detections: {min(i+batch_size, len(records_vd))}/{len(records_vd)} baris.")
 
     df_top10 = df.sort_values(by='raw_risk_score', ascending=False).head(10).copy()
-    # Menggunakan ID yang sama dengan vessel_detections agar tersinkronisasi 1:1
     df_top10_push = df_top10[[c for c in vd_cols if c in df_top10.columns]].replace({np.nan: None})
     records_top10 = df_top10_push.to_dict(orient="records")
     print(f"Mengunggah {len(records_top10)} target prioritas ke top10_priorities...")
