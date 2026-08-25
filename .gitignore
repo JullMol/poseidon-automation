@@ -5,7 +5,6 @@ __pycache__/
 important_output/
 automation/test_june_pipeline.py
 automation/models/
-automation/spatial/
 POSEIDON_DATA_DASHBOARD_2026/
 POSEIDON_WPP711_Outputs_2026/
 *prove_gfw_data.py
