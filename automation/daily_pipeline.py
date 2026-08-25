@@ -706,7 +706,7 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         'length_m_new', 'fishing_score_new', 'vv_intensity_db', 'vh_intensity_db',
         'snr_db', 'dist_to_nearest_mpa_km', 'dist_to_eez_boundary_km',
         'dist_to_nearest_port_km', 'dist_to_nearest_seizure_km',
-        'is_dark', 'ais_flag_country', 'ais_flag_country_encoded'
+        'is_dark', 'ais_flag_country'
     ]
     df_vd = df[[c for c in vd_cols if c in df.columns]].replace({np.nan: None})
     records_vd = df_vd.to_dict(orient="records")
