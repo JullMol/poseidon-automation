@@ -740,7 +740,7 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         'dark_count': int((df['is_dark'] == 1).sum())
     }
     print(f"Mengunggah ringkasan siklus satelit ({date_str}) ke satellite_passes...")
-    supabase.table("satellite_passes").upsert([pass_record], on_conflict="pass_date").execute()
+    supabase.table("satellite_passes").upsert([pass_record]).execute()
     print("Selesai mengunggah seluruh data ke 3 tabel Supabase.")
 
 def run_daily_automation(target_date: datetime.date = None):
