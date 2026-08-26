@@ -534,23 +534,26 @@ def run_pipeline_scoring_gee(df: pd.DataFrame, target_date: datetime.date) -> pd
     df = df.sort_values(by='risk_score', ascending=False).reset_index(drop=True)
     df['rank_siklus'] = range(1, len(df) + 1)
 
-    print("Menerapkan skema penentuan status Siaga berbasis threshold acuan 2025 dari model bundle...")
+    print("Menerapkan skema penentuan status Siaga berbasis threshold acuan P70 (populasi Siaga 1) 2025 dari model bundle...")
     thresholds_by_q = pipeline_models.get('quarterly_alert_thresholds_2025', {})
     curr_q = int((target_date.month - 1) // 3 + 1)
 
-    p90_threshold = None
+    p70_threshold = None
     if isinstance(thresholds_by_q, dict) and curr_q in thresholds_by_q:
         q_info = thresholds_by_q[curr_q]
-        p90_threshold = float(q_info['q90']) if isinstance(q_info, dict) and 'q90' in q_info else float(q_info)
-        print(f"Menggunakan threshold P90 acuan 2025 untuk Q{curr_q} dari model bundle: {p90_threshold:.8f}")
-    elif isinstance(thresholds_by_q, dict) and 'q90' in thresholds_by_q:
-        p90_threshold = float(thresholds_by_q['q90'])
-        print(f"Menggunakan threshold P90 acuan 2025 umum dari model bundle: {p90_threshold:.8f}")
+        if isinstance(q_info, dict):
+            p70_threshold = float(q_info.get('q70', q_info.get('q75', q_info.get('q90', 0.0))))
+        else:
+            p70_threshold = float(q_info)
+        print(f"Menggunakan threshold P70 acuan 2025 untuk Q{curr_q} dari model bundle: {p70_threshold:.8f}")
+    elif isinstance(thresholds_by_q, dict) and any(k in thresholds_by_q for k in ['q70', 'q75', 'q90']):
+        p70_threshold = float(thresholds_by_q.get('q70', thresholds_by_q.get('q75', thresholds_by_q.get('q90', 0.0))))
+        print(f"Menggunakan threshold P70 acuan 2025 umum dari model bundle: {p70_threshold:.8f}")
 
-    if p90_threshold is None:
+    if p70_threshold is None:
         raise ValueError(
             f"[CRITICAL ERROR] Model bundle GEE ('poseidon_models_gee.pkl') tidak memuat "
-            f"threshold P90 'quarterly_alert_thresholds_2025' untuk Kuartal Q{curr_q}. "
+            f"threshold P70 'quarterly_alert_thresholds_2025' untuk Kuartal Q{curr_q}. "
             f"Pastikan file bundle model di Hugging Face sudah ter-update dari notebook master."
         )
 
@@ -559,7 +562,7 @@ def run_pipeline_scoring_gee(df: pd.DataFrame, target_date: datetime.date) -> pd
         rk = int(row['rank_siklus'])
         sc = float(row['risk_score'])
         if rk in [1, 2, 3]:
-            if sc >= p90_threshold:
+            if sc >= p70_threshold:
                 status_list.append('SIAGA 1 (Prioritas)')
             else:
                 status_list.append('SIAGA 1')
