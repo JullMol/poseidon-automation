@@ -29,11 +29,6 @@ HF_MODEL_URLS = {
     "gee_models": f"{HF_BASE_URL}/GEE/poseidon_models_gee.pkl",
 }
 
-GDRIVE_MODEL_IDS = {
-    "length_model": "1IPKwME5f-TgfqE5V3f99JAwKmi4y1e8R",
-    "fishing_model": "1JfJ7ww1f-zRoCF1kezwSTy7e4_1szsxy",
-}
-
 FEATURE_LABELS_MAP = {
     'vv_intensity_db': 'Intensitas Radar VV (dB)',
     'vh_intensity_db': 'Intensitas Radar VH (dB)',
@@ -91,16 +86,6 @@ def load_model_file(model_key: str):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
         return joblib.load(local_path)
 
-    if model_key in GDRIVE_MODEL_IDS:
-        try:
-            import gdown
-            print(f"Mengunduh model {fname} dari Google Drive...")
-            gdown.download(id=GDRIVE_MODEL_IDS[model_key], output=local_path, quiet=True)
-            if os.path.exists(local_path) and os.path.getsize(local_path) > 1000:
-                return joblib.load(local_path)
-        except Exception:
-            pass
-
     hf_url = HF_MODEL_URLS[model_key]
     print(f"Mengunduh model {fname} dari Hugging Face...")
     r = requests.get(hf_url, stream=True, timeout=180)
@@ -124,15 +109,16 @@ def get_p90_quarter_reference_threshold(target_date: datetime.date, supabase_cli
     if supabase_client is None:
         supabase_client = get_supabase()
 
-    print(f"Mengambil data referensi raw_risk_score Q{curr_q} {ref_year} ({start_d} s.d. {end_d}) dari Supabase...")
+    print(f"Mengambil data referensi risk_score Q{curr_q} {ref_year} ({start_d} s.d. {end_d}) khusus populasi Siaga 1 (Rank 1-3) dari Supabase...")
     all_rows = []
     page_size = 1000
     start_idx = 0
     while True:
         resp = supabase_client.table("vessel_detections") \
-            .select("raw_risk_score") \
+            .select("risk_score, rank_siklus") \
             .gte("pass_date", start_d) \
             .lte("pass_date", end_d) \
+            .lte("rank_siklus", 3) \
             .range(start_idx, start_idx + page_size - 1) \
             .execute()
         batch = resp.data if resp.data else []
@@ -144,21 +130,23 @@ def get_p90_quarter_reference_threshold(target_date: datetime.date, supabase_cli
         start_idx += page_size
 
     if all_rows:
-        vals = pd.DataFrame(all_rows)['raw_risk_score'].dropna().values
+        df_s1 = pd.DataFrame(all_rows)
+        vals = df_s1['risk_score'].dropna().values
         if len(vals) > 0:
             p90_val = float(np.percentile(vals, 90))
-            print(f"Ditemukan {len(vals):,} baris data referensi Q{curr_q} {ref_year}. Ambang P90: {p90_val:.8f}")
+            print(f"Ditemukan {len(vals):,} baris data referensi Siaga 1 Q{curr_q} {ref_year}. Ambang P90 (Siaga 1): {p90_val:.8f}")
             return p90_val
 
     start_yr, end_yr = f"{ref_year}-01-01", f"{ref_year}-12-31"
-    print(f"Kuartal kosong, mengambil data referensi tahun penuh {ref_year} dari Supabase...")
+    print(f"Kuartal kosong, mengambil data referensi Siaga 1 tahun penuh {ref_year} dari Supabase...")
     all_rows_yr = []
     start_idx = 0
     while True:
         resp = supabase_client.table("vessel_detections") \
-            .select("raw_risk_score") \
+            .select("risk_score, rank_siklus") \
             .gte("pass_date", start_yr) \
             .lte("pass_date", end_yr) \
+            .lte("rank_siklus", 3) \
             .range(start_idx, start_idx + page_size - 1) \
             .execute()
         batch = resp.data if resp.data else []
@@ -170,21 +158,23 @@ def get_p90_quarter_reference_threshold(target_date: datetime.date, supabase_cli
         start_idx += page_size
 
     if all_rows_yr:
-        vals_yr = pd.DataFrame(all_rows_yr)['raw_risk_score'].dropna().values
+        df_s1_yr = pd.DataFrame(all_rows_yr)
+        vals_yr = df_s1_yr['risk_score'].dropna().values
         if len(vals_yr) > 0:
             p90_val = float(np.percentile(vals_yr, 90))
-            print(f"Ditemukan {len(vals_yr):,} baris data tahun {ref_year}. Ambang P90: {p90_val:.8f}")
+            print(f"Ditemukan {len(vals_yr):,} baris data Siaga 1 tahun {ref_year}. Ambang P90 (Siaga 1): {p90_val:.8f}")
             return p90_val
 
-    resp_all = supabase_client.table("vessel_detections").select("raw_risk_score").limit(5000).execute()
+    resp_all = supabase_client.table("vessel_detections").select("risk_score, rank_siklus").lte("rank_siklus", 3).limit(5000).execute()
     if resp_all.data:
-        vals_all = pd.DataFrame(resp_all.data)['raw_risk_score'].dropna().values
+        df_s1_all = pd.DataFrame(resp_all.data)
+        vals_all = df_s1_all['risk_score'].dropna().values
         if len(vals_all) > 0:
             p90_val = float(np.percentile(vals_all, 90))
-            print(f"Ditemukan {len(vals_all):,} baris sampel Supabase. Ambang P90: {p90_val:.8f}")
+            print(f"Ditemukan {len(vals_all):,} baris sampel Siaga 1 Supabase. Ambang P90 (Siaga 1): {p90_val:.8f}")
             return p90_val
 
-    raise ValueError("Tidak dapat menghitung threshold P90 dari data Supabase vessel_detections.")
+    raise ValueError("Tidak dapat menghitung threshold P90 Siaga 1 dari data Supabase vessel_detections.")
 
 def scrape_gee_daily(target_date: datetime.date) -> pd.DataFrame:
     import ee
@@ -607,25 +597,41 @@ def run_pipeline_scoring_gee(df: pd.DataFrame, target_date: datetime.date) -> pd
     xgb_preds = np.mean([_sigmoid(m.predict(dtest, output_margin=True)) for m in pipeline_models['models_xgb']], axis=0)
 
     raw_scores = w_lgb * lgb_preds + (1.0 - w_lgb) * xgb_preds
-    df['raw_risk_score'] = raw_scores
-    batch_min, batch_max = float(raw_scores.min()), float(raw_scores.max())
-    df['risk_score'] = (raw_scores - batch_min) / (batch_max - batch_min + 1e-9)
+    df['risk_score'] = raw_scores
 
     q_hat = float(pipeline_models['q_hat'])
-    df['conformal_flag'] = (raw_scores >= q_hat).astype(int)
+    df['conformal_flag'] = (df['risk_score'] >= q_hat).astype(int)
 
-    df = df.sort_values(by='raw_risk_score', ascending=False).reset_index(drop=True)
+    df = df.sort_values(by='risk_score', ascending=False).reset_index(drop=True)
     df['rank_siklus'] = range(1, len(df) + 1)
 
-    print("Menerapkan skema penentuan status Siaga baru berbasis kuartal referensi...")
-    p90_threshold = get_p90_quarter_reference_threshold(target_date)
+    print("Menerapkan skema penentuan status Siaga berbasis threshold acuan 2025 dari model bundle...")
+    thresholds_by_q = pipeline_models.get('quarterly_alert_thresholds_2025', {})
+    curr_q = int((target_date.month - 1) // 3 + 1)
+
+    p90_threshold = None
+    if isinstance(thresholds_by_q, dict) and curr_q in thresholds_by_q:
+        q_info = thresholds_by_q[curr_q]
+        p90_threshold = float(q_info['q90']) if isinstance(q_info, dict) and 'q90' in q_info else float(q_info)
+        print(f"Menggunakan threshold P90 acuan 2025 untuk Q{curr_q} dari model bundle: {p90_threshold:.8f}")
+    elif isinstance(thresholds_by_q, dict) and 'q90' in thresholds_by_q:
+        p90_threshold = float(thresholds_by_q['q90'])
+        print(f"Menggunakan threshold P90 acuan 2025 umum dari model bundle: {p90_threshold:.8f}")
+
+    if p90_threshold is None:
+        print("Model bundle tidak memuat quarterly_alert_thresholds_2025, mencoba fallback ke query Supabase...")
+        try:
+            p90_threshold = get_p90_quarter_reference_threshold(target_date)
+        except Exception as e:
+            print(f"Fallback Supabase gagal ({e}), menggunakan default threshold 0.5.")
+            p90_threshold = 0.5
 
     status_list = []
     for _, row in df.iterrows():
         rk = int(row['rank_siklus'])
-        raw_sc = float(row['raw_risk_score'])
+        sc = float(row['risk_score'])
         if rk in [1, 2, 3]:
-            if raw_sc >= p90_threshold:
+            if sc >= p90_threshold:
                 status_list.append('SIAGA 1 (Prioritas)')
             else:
                 status_list.append('SIAGA 1')
@@ -712,7 +718,7 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
 
     df['id'] = range(max_id + 1, max_id + 1 + len(df))
     vd_cols = [
-        'id', 'pass_date', 'timestamp', 'lat', 'lon', 'risk_score', 'raw_risk_score',
+        'id', 'pass_date', 'timestamp', 'lat', 'lon', 'risk_score',
         'status_siaga', 'rank_siklus', 'conformal_flag', 'risk_factors_shap',
         'length_m_new', 'fishing_score_new', 'vv_intensity_db', 'vh_intensity_db',
         'snr_db', 'dist_to_nearest_mpa_km', 'dist_to_eez_boundary_km',
@@ -728,7 +734,7 @@ def push_results_to_supabase(df: pd.DataFrame, target_date: datetime.date):
         supabase.table("vessel_detections").upsert(records_vd[i:i+batch_size]).execute()
         print(f"   Progress vessel_detections: {min(i+batch_size, len(records_vd))}/{len(records_vd)} baris.")
 
-    df_top10 = df.sort_values(by='raw_risk_score', ascending=False).head(10).copy()
+    df_top10 = df.sort_values(by='risk_score', ascending=False).head(10).copy()
     df_top10_push = df_top10[[c for c in vd_cols if c in df_top10.columns]].replace({np.nan: None})
     records_top10 = df_top10_push.to_dict(orient="records")
     print(f"Mengunggah {len(records_top10)} target prioritas ke top10_priorities...")
