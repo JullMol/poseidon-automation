@@ -462,6 +462,14 @@ def integrate_spatial_and_temporal_gee(df: pd.DataFrame, target_date: datetime.d
         if col in df.columns and col in grid_env.columns:
             df[col] = df[col].fillna(float(grid_env[col].median()))
 
+    # Filter presisi: Membuang titik noise di atas daratan murni (bathymetry > 2.0m), sambil menjaga kapal di perairan pantai (bathymetry <= 2.0m)
+    if 'bathymetry' in df.columns:
+        n_before = len(df)
+        df = df[df['bathymetry'] <= 2.0].reset_index(drop=True)
+        n_removed = n_before - len(df)
+        if n_removed > 0:
+            print(f"Filter daratan (Bathymetry): Membuang {n_removed:,} noise di atas daratan, menyisakan {len(df):,} kapal di perairan.")
+
     print("Mencocokkan zona rawan pelanggaran historis (850 hotspot grid)...")
     hotspot_grids = load_hotspot_grids()
     hotspot_set = set(tuple(g) for g in hotspot_grids)
