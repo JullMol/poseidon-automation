@@ -95,87 +95,6 @@ def load_model_file(model_key: str):
             f.write(chunk)
     return joblib.load(local_path)
 
-def get_p90_quarter_reference_threshold(target_date: datetime.date, supabase_client=None) -> float:
-    ref_year = target_date.year - 1
-    curr_q = int((target_date.month - 1) // 3 + 1)
-    q_date_ranges = {
-        1: (f"{ref_year}-01-01", f"{ref_year}-03-31"),
-        2: (f"{ref_year}-04-01", f"{ref_year}-06-30"),
-        3: (f"{ref_year}-07-01", f"{ref_year}-09-30"),
-        4: (f"{ref_year}-10-01", f"{ref_year}-12-31")
-    }
-    start_d, end_d = q_date_ranges[curr_q]
-
-    if supabase_client is None:
-        supabase_client = get_supabase()
-
-    print(f"Mengambil data referensi risk_score Q{curr_q} {ref_year} ({start_d} s.d. {end_d}) khusus populasi Siaga 1 (Rank 1-3) dari Supabase...")
-    all_rows = []
-    page_size = 1000
-    start_idx = 0
-    while True:
-        resp = supabase_client.table("vessel_detections") \
-            .select("risk_score, rank_siklus") \
-            .gte("pass_date", start_d) \
-            .lte("pass_date", end_d) \
-            .lte("rank_siklus", 3) \
-            .range(start_idx, start_idx + page_size - 1) \
-            .execute()
-        batch = resp.data if resp.data else []
-        if not batch:
-            break
-        all_rows.extend(batch)
-        if len(batch) < page_size:
-            break
-        start_idx += page_size
-
-    if all_rows:
-        df_s1 = pd.DataFrame(all_rows)
-        vals = df_s1['risk_score'].dropna().values
-        if len(vals) > 0:
-            p90_val = float(np.percentile(vals, 90))
-            print(f"Ditemukan {len(vals):,} baris data referensi Siaga 1 Q{curr_q} {ref_year}. Ambang P90 (Siaga 1): {p90_val:.8f}")
-            return p90_val
-
-    start_yr, end_yr = f"{ref_year}-01-01", f"{ref_year}-12-31"
-    print(f"Kuartal kosong, mengambil data referensi Siaga 1 tahun penuh {ref_year} dari Supabase...")
-    all_rows_yr = []
-    start_idx = 0
-    while True:
-        resp = supabase_client.table("vessel_detections") \
-            .select("risk_score, rank_siklus") \
-            .gte("pass_date", start_yr) \
-            .lte("pass_date", end_yr) \
-            .lte("rank_siklus", 3) \
-            .range(start_idx, start_idx + page_size - 1) \
-            .execute()
-        batch = resp.data if resp.data else []
-        if not batch:
-            break
-        all_rows_yr.extend(batch)
-        if len(batch) < page_size:
-            break
-        start_idx += page_size
-
-    if all_rows_yr:
-        df_s1_yr = pd.DataFrame(all_rows_yr)
-        vals_yr = df_s1_yr['risk_score'].dropna().values
-        if len(vals_yr) > 0:
-            p90_val = float(np.percentile(vals_yr, 90))
-            print(f"Ditemukan {len(vals_yr):,} baris data Siaga 1 tahun {ref_year}. Ambang P90 (Siaga 1): {p90_val:.8f}")
-            return p90_val
-
-    resp_all = supabase_client.table("vessel_detections").select("risk_score, rank_siklus").lte("rank_siklus", 3).limit(5000).execute()
-    if resp_all.data:
-        df_s1_all = pd.DataFrame(resp_all.data)
-        vals_all = df_s1_all['risk_score'].dropna().values
-        if len(vals_all) > 0:
-            p90_val = float(np.percentile(vals_all, 90))
-            print(f"Ditemukan {len(vals_all):,} baris sampel Siaga 1 Supabase. Ambang P90 (Siaga 1): {p90_val:.8f}")
-            return p90_val
-
-    raise ValueError("Tidak dapat menghitung threshold P90 Siaga 1 dari data Supabase vessel_detections.")
-
 def scrape_gee_daily(target_date: datetime.date) -> pd.DataFrame:
     import ee
     init_gee()
@@ -619,12 +538,11 @@ def run_pipeline_scoring_gee(df: pd.DataFrame, target_date: datetime.date) -> pd
         print(f"Menggunakan threshold P90 acuan 2025 umum dari model bundle: {p90_threshold:.8f}")
 
     if p90_threshold is None:
-        print("Model bundle tidak memuat quarterly_alert_thresholds_2025, mencoba fallback ke query Supabase...")
-        try:
-            p90_threshold = get_p90_quarter_reference_threshold(target_date)
-        except Exception as e:
-            print(f"Fallback Supabase gagal ({e}), menggunakan default threshold 0.5.")
-            p90_threshold = 0.5
+        raise ValueError(
+            f"[CRITICAL ERROR] Model bundle GEE ('poseidon_models_gee.pkl') tidak memuat "
+            f"threshold P90 'quarterly_alert_thresholds_2025' untuk Kuartal Q{curr_q}. "
+            f"Pastikan file bundle model di Hugging Face sudah ter-update dari notebook master."
+        )
 
     status_list = []
     for _, row in df.iterrows():
