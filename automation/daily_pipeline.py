@@ -30,19 +30,21 @@ HF_MODEL_URLS = {
 }
 
 FEATURE_LABELS_MAP = {
-    'vv_intensity_db': 'Intensitas Radar VV (dB)',
-    'vh_intensity_db': 'Intensitas Radar VH (dB)',
-    'radar_intensity_diff': 'Rasio Polarimetri VV/VH (dB)',
-    'background_clutter': 'Derau Hamburan Laut (Clutter)',
-    'snr_db': 'Rasio Sinyal terhadap Derau (SNR dB)',
-    'length_m_new': 'Estimasi Panjang Kapal (m)',
-    'dist_to_nearest_mpa_km': 'Jarak ke Kawasan Konservasi (km)',
-    'dist_to_eez_boundary_km': 'Jarak ke Batas ZEE (km)',
-    'dist_to_nearest_port_km': 'Jarak ke Pelabuhan Terdekat (km)',
-    'dist_to_nearest_seizure_km': 'Jarak ke Titik Tangkapan Historis (km)',
-    'fishing_score_new': 'Indeks Probabilitas Penangkapan Ikan',
-    'historical_hotspot': 'Zona Rawan Pelanggaran Historis',
-    'quarter': 'Kuartal Operasional',
+    'vv_intensity_db': 'Intensitas radar VV (dB)',
+    'vh_intensity_db': 'Intensitas radar VH (dB)',
+    'radar_intensity_diff': 'Rasio VV/VH (dB)',
+    'background_clutter': 'Laut clutter (dB)',
+    'snr_db': 'SNR (dB)',
+    'length_m': 'Panjang kapal',
+    'length_m_new': 'Panjang kapal (estimasi)',
+    'dist_to_nearest_mpa_km': 'Jarak ke kawasan konservasi',
+    'dist_to_eez_boundary_km': 'Jarak ke batas ZEE',
+    'dist_to_nearest_port_km': 'Jarak ke pelabuhan',
+    'dist_to_nearest_seizure_km': 'Jarak ke lokasi Locus delicti',
+    'fishing_score': 'Fishing score',
+    'fishing_score_new': 'Fishing score (estimasi)',
+    'historical_hotspot': 'Zona hotspot historis',
+    'quarter': 'Kuartal',
 }
 
 ALPHA_CONFORMAL = 0.10
